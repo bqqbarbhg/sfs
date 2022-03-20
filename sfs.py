@@ -306,7 +306,7 @@ def do_update(argv, config: Config):
             name, version = dep.split("=", maxsplit=1)
             deps[name] = version
         else:
-            deps[name] = ""
+            deps[dep] = ""
 
     if not deps:
         info("No dependencies listed, list dependencies or use '--all' to update everything")
