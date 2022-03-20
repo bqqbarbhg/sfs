@@ -8,6 +8,7 @@ import json
 import shutil
 import os
 import glob
+import stat
 
 g_git = "git"
 g_verbose = False
@@ -31,6 +32,9 @@ class ReturnCodeError(Exception):
         self.stderr = stderr
 
 class BadGitVersionError(Exception):
+    pass
+
+class TempExistsError(Exception):
     pass
 
 def exec_cmd(*args: str, **kwargs) -> str:
@@ -136,6 +140,16 @@ def file_num_conflicts(path: str) -> int:
     with open(path, "rb") as f:
         data = f.read()
     return data.count(b"<<<<<<<")
+
+def remove_directory(path: str):
+    verbose(f"Removing directory {path}")
+    def onerror(func, path, exc_info):
+        if not os.access(path, os.W_OK):
+            os.chmod(path, stat.S_IWUSR)
+            func(path)
+        else:
+            raise
+    shutil.rmtree(path, onerror=onerror)
 
 class Config:
     dependencies: List["Dependency"]
@@ -321,12 +335,17 @@ def do_update(argv, config: Config):
         pass
 
     tmp_dir = config.tmp_dir
-    shutil.rmtree(tmp_dir, ignore_errors=True)
+    if os.path.exists(tmp_dir) and argv.remove_temp:
+        remove_directory(tmp_dir)
     
     old_dir = os.path.join(tmp_dir, "old")
     new_dir = os.path.join(tmp_dir, "new")
 
-    os.mkdir(tmp_dir)
+    try:
+        os.mkdir(tmp_dir)
+    except FileExistsError:
+        raise TempExistsError(f"Temporary directory {tmp_dir} exists, delete it or use '--remove-temp' to automatically remove it")
+
     os.mkdir(old_dir)
     os.mkdir(new_dir)
 
@@ -413,6 +432,8 @@ if __name__ == "__main__":
     parser.add_argument("--git", default="git", help="Git executable path")
     parser.add_argument("--verbose", action="store_true", help="Print verbose information")
     parser.add_argument("--show-stderr", action="store_true", help="Show stderr of ran commands")
+    parser.add_argument("--keep-temp", action="store_true", help="Retain the temporary directory")
+    parser.add_argument("--remove-temp", action="store_true", help="Remove exiting temporary directory")
     parser.add_argument("--config", "-c", default="sfs-deps.json", help="Configuration .json file path")
 
     subparsers = parser.add_subparsers(metavar="cmd")
@@ -440,5 +461,14 @@ if __name__ == "__main__":
     
     desc = Desc("configuration", config_json)
     config = Config(desc, argv.config)
+    tmp_dir = config.tmp_dir
 
-    argv.func(argv, config)
+    try:
+        argv.func(argv, config)
+    except Exception as e:
+        if os.path.exists(tmp_dir) and not argv.keep_temp:
+            remove_directory(tmp_dir)
+        raise e
+
+    if os.path.exists(tmp_dir) and not argv.keep_temp:
+        remove_directory(tmp_dir)
