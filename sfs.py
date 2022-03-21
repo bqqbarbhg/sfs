@@ -190,9 +190,15 @@ class FileSpec(NamedTuple):
     remote: str
     binary: bool
 
-class CloneResult(NamedTuple):
-    version: str
-    files: List[FileSpec]
+class Clone:
+
+    @abstractmethod
+    def get_revision(self) -> str:
+        ...
+
+    @abstractmethod
+    def finish(self) -> None:
+        ...
 
 class Dependency:
     def __init__(self, name: str, desc: Desc):
@@ -204,52 +210,100 @@ class Dependency:
         self.files = list(parse_filespec(f"{desc.ctx} files", root, files))
 
     @abstractmethod
-    def clone(self, input: CloneInput) -> CloneResult:
+    def clone(self, input: CloneInput) -> Clone:
         ...
 
-class GitDependency(Dependency):
-    def __init__(self, name: str, desc: Desc):
-        super().__init__(name, desc)
-        self.url = parse_str(desc, "url")
-        self.branch = parse_str(desc, "branch", "")
-
-    def clone(self, input: CloneInput) -> CloneResult:
-        def local_git(*args: str, **kwargs) -> str:
-            return exec_git(*args, cwd=input.path, **kwargs)
-        def local_git_lines(*args: str, **kwargs) -> str:
-            return exec_git_lines(*args, cwd=input.path, **kwargs)
-
-        os.mkdir(input.path)
-        local_git("init")
-        local_git("remote", "add", "origin", self.url)
-
-        version = input.version
-        if not version:
-            if not self.branch:
-                main_branch = "master"
-                for line in local_git_lines("remote", "show", "origin"):
-                    m = re.search(r"HEAD branch: ?([^\r\n]+)", line)
-                    if m:
-                        main_branch = m.group(1)
-                        verbose(f"Detected main branch '{main_branch}'")
-                        break
-                version = main_branch
+    def resolve_files(self, remote_path: str) -> Iterator[FileSpec]:
+        for spec in self.files:
+            spec_remote = os.path.join(remote_path, spec.remote)
+            if "*" in spec.remote:
+                assert spec.remote.count("*") == 1
+                assert spec.local.count("*") == 1
+                remote_index = spec.remote.index("*")
+                local_index = spec.local.index("*")
+                remote_pre, remote_post = spec.remote[:remote_index], spec.remote[remote_index+1:]
+                local_pre, local_post = spec.local[:local_index], spec.local[local_index+1:]
+                for file in glob.iglob(spec_remote):
+                    remote = os.path.relpath(file, remote_path)
+                    local = local_pre + remote[len(remote_pre):-len(remote_post)] + local_post
+                    spec = spec._replace(remote=remote, local=local)
+                    yield spec
             else:
-                version = self.branch
+                if os.path.exists(spec_remote):
+                    yield spec
+
+class GitClone(Clone):
+    def __init__(self, dep: "GitDependency", input: CloneInput):
+        self.dep = dep
+        self.input = input
+        self.did_fetch = False
+        os.mkdir(input.path)
+        self.exec_git("init")
+        self.sha = ""
+
+    def exec_git(self, *args: str, **kwargs) -> str:
+        return exec_git(*args, cwd=self.input.path, **kwargs)
+
+    def exec_git_lines(self, *args: str, **kwargs) -> str:
+        return exec_git_lines(*args, cwd=self.input.path, **kwargs)
+
+    def fetch(self):
+        if self.did_fetch: return
+        self.did_fetch = True
+        self.exec_git("remote", "add", "origin", self.dep.url)
 
         filter = []
         if g_git_version >= (2,25):
             filter = ["--filter=blob:none"]
-            local_git("config", "--local", "extensions.partialClone", "origin")
+            self.exec_git("config", "--local", "extensions.partialClone", "origin")
 
-        local_git("fetch", "--depth=1", *filter, "origin", version)
-        new_version = local_git("rev-parse", "FETCH_HEAD")
-        verbose(f"At commit {new_version}")
+        self.exec_git("fetch", "--depth=1", *filter, "origin", self.input.version)
+        if self.input.exact:
+            self.sha = self.input.version
+        else:
+            self.sha = self.exec_git("rev-parse", "FETCH_HEAD")
+
+    @abstractmethod
+    def get_revision(self) -> str:
+        version = self.input.version
+        version_kind = ""
+
+        if not version:
+            if self.dep.branch:
+                version = self.dep.branch
+                version_kind = "branch"
+            elif self.dep.tag:
+                version = self.dep.tag
+                version_kind = "tag"
+            else:
+                version = "HEAD"
+                version_kind = "head"
+
+        if version and version_kind in ("branch", "tag", "head"):
+            # Try to use `git ls-remote` to avoid cloning
+            if version_kind == "branch":
+                ref = f"refs/heads/{version}"
+            elif version_kind == "tag":
+                ref = f"refs/tags/{version}"
+            elif version_kind == "head":
+                ref = "HEAD"
+            for line in self.exec_git_lines("ls-remote", self.dep.url, ref):
+                parts = line.split(maxsplit=1)
+                if parts[1] == ref:
+                    self.sha = parts[0]
+                    return self.sha
+
+        self.fetch()
+        return self.sha
+
+    @abstractmethod
+    def finish(self) -> None:
+        self.fetch()
 
         files = []
-        for filespec in self.files:
+        for filespec in self.dep.files:
             try:
-                local_git("checkout", new_version, "--", filespec.remote)
+                self.exec_git("checkout", self.sha, "--", filespec.remote)
                 if "*" in filespec.remote:
                     assert filespec.remote.count("*") == 1
                     assert filespec.local.count("*") == 1
@@ -269,7 +323,15 @@ class GitDependency(Dependency):
                     continue
                 raise err
 
-        return CloneResult(version=new_version, files=files)
+class GitDependency(Dependency):
+    def __init__(self, name: str, desc: Desc):
+        super().__init__(name, desc)
+        self.url = parse_str(desc, "url")
+        self.branch = parse_str(desc, "branch", "")
+        self.tag = parse_str(desc, "tag", "")
+
+    def clone(self, input: CloneInput) -> Clone:
+        return GitClone(self, input)
 
 def join_path(a: str, b: str) -> str:
     if a.endswith("/"): a = a[:-1]
@@ -359,29 +421,35 @@ def do_update(argv, config: Config):
         new_dep_dir = os.path.join(new_dir, dep.name)
 
         lock = locks.get(dep.name)
-        if lock is not None:
-            verbose(f"-- Cloning old {dep.name}")
-            old_result = dep.clone(CloneInput(path=old_dep_dir, version=lock, exact=True))
-        else:
-            old_result = None
 
-        verbose(f"-- Cloning new {dep.name}")
-        new_result = dep.clone(CloneInput(path=new_dep_dir, version=version, exact=False))
+        verbose(f"-- Querying new revision {dep.name}")
+        new_clone = dep.clone(CloneInput(path=new_dep_dir, version=version, exact=False))
+        new_revision = new_clone.get_revision()
 
-        if old_result and new_result.version == old_result.version:
-            info(f"{dep.name}: Already up to date at {new_result.version}")
+        if new_revision == lock:
+            info(f"{dep.name}: Already up to date at {new_revision}")
             continue
         else:
-            info(f"{dep.name}: Updating to {new_result.version}")
+            info(f"{dep.name}: Updating to {new_revision}")
+
+        new_clone.finish()
+
+        if lock is not None:
+            verbose(f"-- Cloning old revision {dep.name} {lock}")
+            old_clone = dep.clone(CloneInput(path=old_dep_dir, version=lock, exact=True))
+            old_clone.get_revision()
+            old_clone.finish()
+
+        old_files = list(dep.resolve_files(old_dep_dir))
+        new_files = list(dep.resolve_files(new_dep_dir))
 
         modified_files = set()
 
-        if old_result:
-            for file in old_result.files:
-                local_path = os.path.join(dst_dir, file.local)
-                remote_path = os.path.join(old_dep_dir, file.remote)
-                if os.path.exists(local_path) and not files_equal(local_path, remote_path, file.binary):
-                    modified_files.add(file.local)
+        for file in old_files:
+            local_path = os.path.join(dst_dir, file.local)
+            remote_path = os.path.join(old_dep_dir, file.remote)
+            if os.path.exists(local_path) and not files_equal(local_path, remote_path, file.binary):
+                modified_files.add(file.local)
 
         if modified_files and not (argv.merge or argv.overwrite):
             info("WARNING: Not updated! Files modified locally (specify '--merge' or '--overwrite' to resolve):")
@@ -389,7 +457,7 @@ def do_update(argv, config: Config):
                 info(f"  {file}")
             continue
 
-        for file in new_result.files:
+        for file in new_files:
             local_path = os.path.join(dst_dir, file.local)
             new_path = os.path.join(new_dep_dir, file.remote)
             if os.path.exists(local_path) and files_equal(local_path, new_path, file.binary):
@@ -418,7 +486,7 @@ def do_update(argv, config: Config):
                         info(f"  Added {file.local}")
                 shutil.copyfile(new_path, local_path)
         
-        locks[dep.name] = new_result.version
+        locks[dep.name] = new_revision
 
     with open(config.lockfile, "wt", encoding="utf-8") as f:
         for dep in config.dependencies:
