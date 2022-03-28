@@ -240,6 +240,7 @@ class GitClone(Clone):
         os.mkdir(input.path)
         self.exec_git("init")
         self.sha = ""
+        self.version = ""
 
     def exec_git(self, *args: str, **kwargs) -> str:
         return exec_git(*args, cwd=self.input.path, **kwargs)
@@ -257,11 +258,13 @@ class GitClone(Clone):
             filter = ["--filter=blob:none"]
             self.exec_git("config", "--local", "extensions.partialClone", "origin")
 
-        self.exec_git("fetch", "--depth=1", *filter, "origin", self.input.version)
-        if self.input.exact:
-            self.sha = self.input.version
-        else:
-            self.sha = self.exec_git("rev-parse", "FETCH_HEAD")
+        self.exec_git("fetch", "--depth=1", *filter, "origin", self.version)
+
+        if not self.sha:
+            if self.input.exact:
+                self.sha = self.input.version
+            else:
+                self.sha = self.exec_git("rev-parse", "FETCH_HEAD")
 
     @abstractmethod
     def get_revision(self) -> str:
@@ -279,6 +282,7 @@ class GitClone(Clone):
                 version = "HEAD"
                 version_kind = "head"
 
+        self.version = version
         if version and version_kind in ("branch", "tag", "head"):
             # Try to use `git ls-remote` to avoid cloning
             if version_kind == "branch":
@@ -290,7 +294,7 @@ class GitClone(Clone):
             for line in self.exec_git_lines("ls-remote", self.dep.url, ref):
                 parts = line.split(maxsplit=1)
                 if parts[1] == ref:
-                    self.sha = parts[0]
+                    self.version = self.sha = parts[0]
                     return self.sha
 
         self.fetch()
@@ -483,6 +487,10 @@ def do_update(argv, config: Config):
                     if os.path.exists(local_path):
                         info(f"  Updated {file.local}")
                     else:
+                        dirname = os.path.dirname(local_path)
+                        if not os.path.exists(dirname):
+                            info(f"  Creating directory {os.path.dirname(local_path)}")
+                            os.makedirs(dirname, exist_ok=True)
                         info(f"  Added {file.local}")
                 shutil.copyfile(new_path, local_path)
         
