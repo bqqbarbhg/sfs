@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 from abc import abstractmethod
 from subprocess import Popen, PIPE
 from typing import List, Union, Tuple, NamedTuple, Optional, Iterator
